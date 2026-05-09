@@ -137,6 +137,8 @@ class MacApp:
 
         self.provider_label = ttk.Label(frame, text="当前 provider:", style="Info.TLabel")
         self.provider_label.pack(anchor="w")
+        self.provider_kind_label = ttk.Label(frame, text="provider 类型:", style="Info.TLabel")
+        self.provider_kind_label.pack(anchor="w")
         self.provider_source_label = ttk.Label(frame, text="provider 来源:", style="Info.TLabel")
         self.provider_source_label.pack(anchor="w")
         self.model_label = ttk.Label(frame, text="当前模型:", style="Info.TLabel")
@@ -260,6 +262,7 @@ class MacApp:
 
         self.current_status = payload
         self.provider_label.config(text=f"当前 provider: {payload['current_provider']}")
+        self.provider_kind_label.config(text=f"provider 类型: {payload.get('current_provider_kind') or '未识别'}")
         self.provider_source_label.config(
             text=f"provider 来源: {payload.get('current_provider_source') or '未识别'}"
         )

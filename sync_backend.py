@@ -23,6 +23,9 @@ class Paths:
     codex_home: Path
     config_path: Path
     db_path: Path
+    modern_db_path: Path
+    session_index_path: Path
+    sessions_root: Path
     backup_dir: Path
 
 
@@ -32,6 +35,9 @@ def resolve_paths(codex_home: str | None) -> Paths:
         codex_home=home,
         config_path=home / "config.toml",
         db_path=home / "state_5.sqlite",
+        modern_db_path=home / "sqlite" / "codex-dev.db",
+        session_index_path=home / "session_index.jsonl",
+        sessions_root=home / "sessions",
         backup_dir=home / "history_sync_backups",
     )
 
@@ -45,6 +51,10 @@ def normalize_provider_name(provider: str) -> str:
     if not value:
         raise RuntimeError("Provider cannot be empty.")
     return value
+
+
+def classify_provider_kind(provider: str) -> str:
+    return "official" if normalize_provider_name(provider) == "openai" else "third_party"
 
 
 def parse_current_provider(config_text: str) -> str | None:
@@ -94,18 +104,29 @@ def read_provider_from_auth(paths: Paths) -> str | None:
     return None
 
 
-def resolve_current_provider(paths: Paths, config_text: str, conn: sqlite3.Connection) -> tuple[str, str]:
+def resolve_current_provider(
+    paths: Paths,
+    config_text: str,
+    conn: sqlite3.Connection | None,
+    mode: str,
+) -> tuple[str, str]:
     config_provider = parse_current_provider(config_text)
     if config_provider:
         return config_provider, "config:model_provider"
 
-    latest_thread_provider = read_latest_thread_provider(conn)
-    if latest_thread_provider:
-        return latest_thread_provider, "threads:latest_updated"
-
     auth_provider = read_provider_from_auth(paths)
     if auth_provider:
         return auth_provider, "auth.json"
+
+    if mode == "legacy_db" and conn is not None:
+        latest_thread_provider = read_latest_thread_provider(conn)
+        if latest_thread_provider:
+            return latest_thread_provider, "threads:latest_updated"
+
+    if mode == "session_files":
+        latest_session_provider = read_provider_from_session_index(paths)
+        if latest_session_provider:
+            return latest_session_provider, "session_index:latest_updated"
 
     raise RuntimeError(
         "Could not determine the active provider. Set model_provider in config.toml or use sync --target-provider."
@@ -120,11 +141,33 @@ def connect_db(path: Path, readonly: bool = False) -> sqlite3.Connection:
     return conn
 
 
-def ensure_environment(paths: Paths) -> None:
+def has_legacy_storage(paths: Paths) -> bool:
+    return paths.db_path.exists()
+
+
+def has_modern_storage(paths: Paths) -> bool:
+    return paths.session_index_path.exists() and paths.sessions_root.exists()
+
+
+def storage_mode(paths: Paths) -> str:
+    if has_legacy_storage(paths):
+        return "legacy_db"
+    if has_modern_storage(paths):
+        return "session_files"
+    return "missing"
+
+
+def ensure_environment(paths: Paths, require_legacy_db: bool = False) -> str:
     if not paths.config_path.exists():
         raise RuntimeError(f"Missing config file: {paths.config_path}")
-    if not paths.db_path.exists():
+    mode = storage_mode(paths)
+    if require_legacy_db and mode != "legacy_db":
         raise RuntimeError(f"Missing database file: {paths.db_path}")
+    if mode == "missing":
+        raise RuntimeError(
+            "Missing Codex history storage. Expected state_5.sqlite or session_index.jsonl + sessions/."
+        )
+    return mode
 
 
 def query_provider_counts(conn: sqlite3.Connection) -> OrderedDict[str, int]:
@@ -141,6 +184,31 @@ def query_provider_counts(conn: sqlite3.Connection) -> OrderedDict[str, int]:
     return counts
 
 
+def current_provider_for_movement(
+    paths: Paths,
+    config_text: str,
+    mode: str,
+    conn: sqlite3.Connection | None,
+) -> tuple[str, str]:
+    config_provider = parse_current_provider(config_text)
+    if config_provider:
+        return config_provider, "config:model_provider"
+    auth_provider = read_provider_from_auth(paths)
+    if auth_provider:
+        return auth_provider, "auth.json"
+    return resolve_current_provider(paths, config_text, conn, mode)
+
+
+def query_provider_counts_from_session_index(paths: Paths) -> OrderedDict[str, int]:
+    counts = OrderedDict()
+    for row in iter_session_index_rows(paths):
+        session_path = session_path_for_thread_id(paths, row["id"])
+        provider, status = read_session_meta_provider(session_path)
+        key = provider if status == "ok" and provider else "(empty)"
+        counts[key] = counts.get(key, 0) + 1
+    return OrderedDict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
 def iter_rollout_paths(conn: sqlite3.Connection) -> list[Path]:
     paths: list[Path] = []
     for (rollout_path,) in conn.execute(
@@ -153,6 +221,63 @@ def iter_rollout_paths(conn: sqlite3.Connection) -> list[Path]:
     ):
         paths.append(Path(rollout_path))
     return paths
+
+
+def iter_session_index_rows(paths: Paths) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not paths.session_index_path.exists():
+        return rows
+    try:
+        with paths.session_index_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                thread_id = payload.get("id")
+                if not isinstance(thread_id, str) or not thread_id.strip():
+                    continue
+                rows.append(payload)
+    except OSError:
+        return []
+    return rows
+
+
+def session_path_for_thread_id(paths: Paths, thread_id: str) -> Path:
+    if paths.sessions_root.exists():
+        for candidate in paths.sessions_root.rglob("*.jsonl"):
+            session_meta_obj, status = read_session_meta(candidate)
+            if status != "ok" or not session_meta_obj:
+                continue
+            payload = session_meta_obj.get("payload")
+            if isinstance(payload, dict) and payload.get("id") == thread_id:
+                return candidate
+    return paths.sessions_root / f"{thread_id}.jsonl"
+
+
+def iso_to_epoch_seconds(value: str | None) -> int:
+    if not value or not isinstance(value, str):
+        return 0
+    try:
+        normalized = value.replace("Z", "+00:00")
+        return int(datetime.fromisoformat(normalized).timestamp())
+    except ValueError:
+        return 0
+
+
+def read_provider_from_session_index(paths: Paths) -> str | None:
+    rows = iter_session_index_rows(paths)
+    if not rows:
+        return None
+    latest = max(rows, key=lambda item: iso_to_epoch_seconds(str(item.get("updated_at") or "")))
+    provider, status = read_session_meta_provider(session_path_for_thread_id(paths, latest["id"]))
+    if status == "ok" and provider:
+        return normalize_provider_name(provider)
+    return None
 
 
 def read_session_meta_provider(path: Path) -> tuple[str | None, str]:
@@ -329,32 +454,54 @@ def resolve_local_session_path(paths: Paths, rollout_path: str) -> Path:
 
 
 def get_status(paths: Paths) -> dict[str, object]:
-    ensure_environment(paths)
+    mode = ensure_environment(paths)
     config_text = read_text(paths.config_path)
     current_model = parse_current_model(config_text)
 
-    with connect_db(paths.db_path, readonly=True) as conn:
-        current_provider, current_provider_source = resolve_current_provider(paths, config_text, conn)
-        counts = query_provider_counts(conn)
-        total_threads = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
-        moved_if_sync = conn.execute(
-            "SELECT COUNT(*) FROM threads WHERE model_provider <> ?",
-            (current_provider,),
-        ).fetchone()[0]
+    if mode == "legacy_db":
+        with connect_db(paths.db_path, readonly=True) as conn:
+            current_provider, current_provider_source = resolve_current_provider(paths, config_text, conn, mode)
+            movement_provider, _movement_provider_source = current_provider_for_movement(paths, config_text, mode, conn)
+            counts = query_provider_counts(conn)
+            total_threads = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+            moved_if_sync = conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE model_provider <> ?",
+                (movement_provider,),
+            ).fetchone()[0]
+            repair_candidates = 0
+            for cwd, rollout_path in conn.execute("SELECT cwd, rollout_path FROM threads"):
+                if is_cross_device_thread(cwd, rollout_path):
+                    repair_candidates += 1
+            rollout_paths = iter_rollout_paths(conn)
+            session_scan = scan_session_files(current_provider, rollout_paths)
+        db_path_text = str(paths.db_path)
+    else:
+        current_provider, current_provider_source = resolve_current_provider(paths, config_text, None, mode)
+        movement_provider, _movement_provider_source = current_provider_for_movement(paths, config_text, mode, None)
+        counts = query_provider_counts_from_session_index(paths)
+        rows = iter_session_index_rows(paths)
+        total_threads = len(rows)
+        moved_if_sync = 0
+        rollout_paths: list[Path] = []
+        for row in rows:
+            session_path = session_path_for_thread_id(paths, row["id"])
+            rollout_paths.append(session_path)
+            provider, status = read_session_meta_provider(session_path)
+            if status == "ok" and provider != movement_provider:
+                moved_if_sync += 1
         repair_candidates = 0
-        for cwd, rollout_path in conn.execute("SELECT cwd, rollout_path FROM threads"):
-            if is_cross_device_thread(cwd, rollout_path):
-                repair_candidates += 1
-        rollout_paths = iter_rollout_paths(conn)
         session_scan = scan_session_files(current_provider, rollout_paths)
+        db_path_text = str(paths.modern_db_path if paths.modern_db_path.exists() else paths.session_index_path)
 
     return {
         "codex_home": str(paths.codex_home),
         "config_path": str(paths.config_path),
-        "db_path": str(paths.db_path),
+        "db_path": db_path_text,
         "backup_dir": str(paths.backup_dir),
+        "storage_mode": mode,
         "current_provider": current_provider,
         "current_provider_source": current_provider_source,
+        "current_provider_kind": classify_provider_kind(current_provider),
         "current_model": current_model,
         "total_threads": total_threads,
         "movable_threads": moved_if_sync,
@@ -372,6 +519,7 @@ def make_backup(paths: Paths, label: str, timestamp: str | None = None) -> Path:
     backup_path = paths.backup_dir / f"state_5.sqlite.{label}.{ts}.bak"
     with connect_db(paths.db_path, readonly=True) as source, connect_db(backup_path, readonly=False) as target:
         source.backup(target)
+        target.commit()
     return backup_path
 
 
@@ -440,8 +588,12 @@ def sync_session_files(
     target_provider: str,
     session_backup_dir: Path,
 ) -> dict[str, object]:
-    with connect_db(paths.db_path, readonly=True) as conn:
-        rollout_paths = iter_rollout_paths(conn)
+    mode = ensure_environment(paths)
+    if mode == "legacy_db":
+        with connect_db(paths.db_path, readonly=True) as conn:
+            rollout_paths = iter_rollout_paths(conn)
+    else:
+        rollout_paths = [session_path_for_thread_id(paths, row["id"]) for row in iter_session_index_rows(paths)]
 
     stats: dict[str, int] = {
         "total_files": len(rollout_paths),
@@ -639,35 +791,65 @@ def repair_imported_threads(
 
 
 def list_threads(paths: Paths, limit: int = 200) -> dict[str, object]:
-    ensure_environment(paths)
-    with connect_db(paths.db_path, readonly=True) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT id, title, cwd, rollout_path, updated_at, updated_at_ms
-            FROM threads
-            ORDER BY updated_at DESC, updated_at_ms DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-
+    mode = ensure_environment(paths)
     threads: list[dict[str, object]] = []
-    for row in rows:
-        jsonl_title = read_latest_thread_name(resolve_local_session_path(paths, row["rollout_path"]), row["id"])
-        display_title = jsonl_title or row["title"]
-        threads.append(
-            {
-                "id": row["id"],
-                "title": row["title"],
-                "display_title": display_title,
-                "title_source": "jsonl:thread_name_updated" if jsonl_title else "threads.title",
-                "cwd": row["cwd"],
-                "rollout_path": row["rollout_path"],
-                "updated_at": row["updated_at"],
-                "updated_at_ms": row["updated_at_ms"],
-            }
-        )
+
+    if mode == "legacy_db":
+        with connect_db(paths.db_path, readonly=True) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, title, cwd, rollout_path, updated_at, updated_at_ms
+                FROM threads
+                ORDER BY updated_at DESC, updated_at_ms DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        for row in rows:
+            jsonl_title = read_latest_thread_name(resolve_local_session_path(paths, row["rollout_path"]), row["id"])
+            display_title = jsonl_title or row["title"]
+            threads.append(
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "display_title": display_title,
+                    "title_source": "jsonl:thread_name_updated" if jsonl_title else "threads.title",
+                    "cwd": row["cwd"],
+                    "rollout_path": row["rollout_path"],
+                    "updated_at": row["updated_at"],
+                    "updated_at_ms": row["updated_at_ms"],
+                }
+            )
+    else:
+        rows = sorted(
+            iter_session_index_rows(paths),
+            key=lambda item: iso_to_epoch_seconds(str(item.get("updated_at") or "")),
+            reverse=True,
+        )[:limit]
+        for row in rows:
+            thread_id = str(row["id"])
+            session_path = session_path_for_thread_id(paths, thread_id)
+            session_meta_obj, status = read_session_meta(session_path)
+            payload = session_meta_obj.get("payload", {}) if status == "ok" and session_meta_obj else {}
+            cwd = payload.get("cwd", "")
+            raw_title = str(row.get("thread_name") or payload.get("title") or thread_id)
+            jsonl_title = read_latest_thread_name(session_path, thread_id)
+            display_title = jsonl_title or raw_title
+            updated_at = iso_to_epoch_seconds(str(row.get("updated_at") or ""))
+            threads.append(
+                {
+                    "id": thread_id,
+                    "title": raw_title,
+                    "display_title": display_title,
+                    "title_source": "jsonl:thread_name_updated" if jsonl_title else "session_index.thread_name",
+                    "cwd": cwd,
+                    "rollout_path": str(session_path),
+                    "updated_at": updated_at,
+                    "updated_at_ms": updated_at * 1000,
+                }
+            )
 
     return {
         "action": "list-threads",
@@ -800,22 +982,29 @@ def sync_to_target_provider(
     sync_sessions: bool = True,
     status_before: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    ensure_environment(paths)
+    mode = ensure_environment(paths)
     normalized_target_provider = normalize_provider_name(target_provider)
     if status_before is None:
         status_before = get_status(paths)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = make_backup(paths, "pre-sync", timestamp=timestamp)
+    backup_path: str | None
 
-    with connect_db(paths.db_path, readonly=False) as conn:
-        before_counts = query_provider_counts(conn)
-        updated_rows = conn.execute(
-            "UPDATE threads SET model_provider = ? WHERE model_provider <> ?",
-            (normalized_target_provider, normalized_target_provider),
-        ).rowcount
-        conn.commit()
-        checkpoint_result = checkpoint(conn)
-        after_counts = query_provider_counts(conn)
+    if mode == "legacy_db":
+        backup_path = str(make_backup(paths, "pre-sync", timestamp=timestamp))
+        with connect_db(paths.db_path, readonly=False) as conn:
+            before_counts = query_provider_counts(conn)
+            updated_rows = conn.execute(
+                "UPDATE threads SET model_provider = ? WHERE model_provider <> ?",
+                (normalized_target_provider, normalized_target_provider),
+            ).rowcount
+            conn.commit()
+            checkpoint_result = checkpoint(conn)
+            after_counts = query_provider_counts(conn)
+    else:
+        before_counts = query_provider_counts_from_session_index(paths)
+        updated_rows = 0
+        checkpoint_result = (0, 0, 0)
+        backup_path = None
 
     session_sync_payload: dict[str, object]
     if sync_sessions:
@@ -824,6 +1013,9 @@ def sync_to_target_provider(
     else:
         session_sync_payload = {"skipped": True}
 
+    if mode == "session_files":
+        after_counts = query_provider_counts_from_session_index(paths)
+
     status_after = get_status(paths)
 
     return {
@@ -831,7 +1023,7 @@ def sync_to_target_provider(
         "target_provider": normalized_target_provider,
         "status_before": status_before,
         "updated_rows": updated_rows,
-        "backup_path": str(backup_path),
+        "backup_path": backup_path,
         "before_counts": [{"provider": key, "count": value} for key, value in before_counts.items()],
         "after_counts": [{"provider": key, "count": value} for key, value in after_counts.items()],
         "checkpoint": {

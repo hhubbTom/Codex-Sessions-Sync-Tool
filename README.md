@@ -4,11 +4,12 @@
 
 ## 说明
 
-当你切换 API、provider 或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库，并把旧线程重新挂到当前正在使用的 `model_provider` 下面。新版也支持显式指定目标 provider，并兼容官方登录场景下 `config.toml` 不再写入 `model_provider` 的情况。
+当你切换 API、provider 或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史索引，并把旧线程重新挂到目标 `model_provider` 下面。当前版本优先兼容新版 Codex Desktop 存储结构：`session_index.jsonl + sessions/*.jsonl + sqlite/codex-dev.db`；如果本机仍在使用旧版 `state_5.sqlite`，也会自动兼容。工具内置的判断规则是：只有 `openai` 视为官方，其他任意 provider 名称都视为第三方。
 
 ## 这个工具能做什么
 
 - 查看当前本机 Codex 历史线程属于哪些 provider
+- 自动识别新版或旧版 Codex 本地历史存储结构
 - 一键把旧 provider 下的线程同步到当前 provider
 - 显式把历史线程同步到指定 provider
 - 在同步前自动备份数据库
@@ -131,6 +132,7 @@ python3 ./sync_backend.py --json restore
 - 每次同步前都会自动创建一份备份
 - 每次恢复前也会先创建一份安全备份
 - 备份默认保存在 `%USERPROFILE%\\.codex\\history_sync_backups`
+- `sessions.pre-sync.*` 这类目录是会话文件备份，不建议在确认问题修复前删除
 
 ## 使用建议
 

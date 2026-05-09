@@ -180,6 +180,7 @@ class MoveThreadTests(unittest.TestCase):
 
         self.assertEqual(status["current_provider"], "OpenAI")
         self.assertEqual(status["current_provider_source"], "config:model_provider")
+        self.assertEqual(status["current_provider_kind"], "third_party")
 
     def test_sync_to_explicit_target_provider_updates_sqlite_and_session_meta(self) -> None:
         result = sync_backend.sync_to_target_provider(
@@ -203,6 +204,160 @@ class MoveThreadTests(unittest.TestCase):
         first_line = self.session_path.read_text(encoding="utf-8").splitlines()[0]
         session_meta = json.loads(first_line)
         self.assertEqual(session_meta["payload"]["model_provider"], "anthropic")
+
+    def test_provider_kind_treats_only_lowercase_openai_as_official(self) -> None:
+        self.assertEqual(sync_backend.classify_provider_kind("openai"), "official")
+        self.assertEqual(sync_backend.classify_provider_kind("OpenAI"), "third_party")
+        self.assertEqual(sync_backend.classify_provider_kind("custom"), "third_party")
+
+
+class ModernStorageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.codex_home = self.root / ".codex"
+        self.codex_home.mkdir()
+        self.sessions_dir = self.codex_home / "sessions" / "2026" / "05" / "09"
+        self.sessions_dir.mkdir(parents=True)
+        self.sqlite_dir = self.codex_home / "sqlite"
+        self.sqlite_dir.mkdir()
+        self.config_path = self.codex_home / "config.toml"
+        self.config_path.write_text('model = "gpt-5.5"\n', encoding="utf-8")
+        (self.codex_home / "auth.json").write_text('{"logged_in": true}\n', encoding="utf-8")
+        (self.sqlite_dir / "codex-dev.db").touch()
+
+        self.official_id = "official-thread"
+        self.third_party_id = "third-party-thread"
+
+        self.official_session_path = self.sessions_dir / "rollout-official.jsonl"
+        self.third_party_session_path = self.sessions_dir / "rollout-third-party.jsonl"
+
+        self.official_session_path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self.official_id,
+                        "cwd": "/official/project",
+                        "model_provider": "openai",
+                        "timestamp": "2026-05-09T07:05:14.965Z",
+                    },
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_name_updated",
+                        "thread_id": self.official_id,
+                        "thread_name": "官方会话",
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.third_party_session_path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self.third_party_id,
+                        "cwd": "/third/project",
+                        "model_provider": "OpenAI",
+                        "timestamp": "2026-05-09T07:06:14.965Z",
+                    },
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_name_updated",
+                        "thread_id": self.third_party_id,
+                        "thread_name": "第三方会话",
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        (self.codex_home / "session_index.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": self.official_id,
+                            "thread_name": "官方会话",
+                            "updated_at": "2026-05-09T07:05:27.312658Z",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "id": self.third_party_id,
+                            "thread_name": "第三方会话",
+                            "updated_at": "2026-05-09T07:06:27.312658Z",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self.paths = sync_backend.resolve_paths(str(self.codex_home))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_get_status_reads_modern_storage_without_state_db(self) -> None:
+        status = sync_backend.get_status(self.paths)
+
+        self.assertEqual(status["current_provider"], "openai")
+        self.assertEqual(status["current_provider_source"], "auth.json")
+        self.assertEqual(status["total_threads"], 2)
+        self.assertEqual(status["movable_threads"], 1)
+        self.assertEqual(status["storage_mode"], "session_files")
+        self.assertEqual(
+            [(row["provider"], row["count"]) for row in status["provider_counts"]],
+            [("OpenAI", 1), ("openai", 1)],
+        )
+
+    def test_list_threads_reads_titles_and_order_from_modern_storage(self) -> None:
+        result = sync_backend.list_threads(self.paths)
+
+        self.assertEqual(result["threads"][0]["id"], self.third_party_id)
+        self.assertEqual(result["threads"][0]["display_title"], "第三方会话")
+        self.assertEqual(result["threads"][1]["id"], self.official_id)
+        self.assertEqual(result["threads"][1]["display_title"], "官方会话")
+
+    def test_sync_updates_session_meta_without_state_db(self) -> None:
+        result = sync_backend.sync_to_target_provider(
+            self.paths,
+            target_provider="custom",
+            sync_sessions=True,
+        )
+
+        self.assertEqual(result["target_provider"], "custom")
+        self.assertEqual(result["updated_rows"], 0)
+        self.assertEqual(result["session_sync"]["stats"]["updated_files"], 2)
+        self.assertEqual(result["status_after"]["current_provider"], "openai")
+        self.assertEqual(
+            [(row["provider"], row["count"]) for row in result["status_after"]["provider_counts"]],
+            [("custom", 2)],
+        )
+
+        official_meta = json.loads(self.official_session_path.read_text(encoding="utf-8").splitlines()[0])
+        third_party_meta = json.loads(self.third_party_session_path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(official_meta["payload"]["model_provider"], "custom")
+        self.assertEqual(third_party_meta["payload"]["model_provider"], "custom")
 
 
 if __name__ == "__main__":
